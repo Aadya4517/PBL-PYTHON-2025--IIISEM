@@ -1,0 +1,883 @@
+
+import os, random, string, hashlib, subprocess, sys
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from datetime import datetime, date, timedelta
+from shutil import copy2
+import mysql.connector
+
+# Try imports used for TOTP QR code display
+try:
+    import pyotp
+except Exception:
+    pyotp = None
+
+try:
+    import qrcode
+    from PIL import Image, ImageTk
+except Exception:
+    qrcode = None
+    Image = None
+    ImageTk = None
+
+# ---------- CONFIG ----------
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': 'AAT(1511)',   # ← change to your MySQL password
+    'database': 'share_ride'
+}
+
+UPLOAD_DIR = os.path.join(os.getcwd(), 'uploads')
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+ALLOWED_UPLOAD_EXT = {'.pdf'}
+
+# Theme colors
+BG = '#FBF4E6'
+CARD = '#FFFFFF'
+PRIMARY = '#F6A821'
+SECOND = '#2E8B57'
+ACCENT = '#FF6F4A'
+TEXT = '#222222'
+
+# Payment reminder delay (ms) after booking (5s default)
+PAYMENT_REMINDER_MS = 5000
+
+# ---------- HELPERS ----------
+def get_conn():
+    try:
+        return mysql.connector.connect(**DB_CONFIG)
+    except Exception as e:
+        messagebox.showerror("DB error", str(e))
+        return None
+
+def gen_tr_id():
+    t = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    r = ''.join(random.choices(string.digits, k=4))
+    return f"TX{t}{r}"
+
+def hash_pin(pin: str):
+    return hashlib.sha256(pin.encode()).hexdigest()
+
+def filesize_ok(path):
+    try:
+        return os.path.getsize(path) <= MAX_UPLOAD_BYTES
+    except:
+        return False
+
+def open_file_with_default(path):
+    try:
+        if sys.platform.startswith('win'):
+            os.startfile(path)
+        elif sys.platform.startswith('darwin'):
+            subprocess.Popen(['open', path])
+        else:
+            subprocess.Popen(['xdg-open', path])
+    except Exception:
+        # ignore failures to open
+        pass
+
+# ---------- DB FUNCTIONS ----------
+def insert_user(name, phone, gender, roles_list, totp_secret=None):
+    conn = get_conn()
+    if not conn: return None
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO users (name, phone, gender, totp_secret) VALUES (%s,%s,%s,%s)", (name, phone, gender, totp_secret))
+        conn.commit()
+        uid = cur.lastrowid
+        # assign roles (user_roles table)
+        for rn in roles_list:
+            cur.execute("SELECT role_id FROM roles WHERE role_name=%s LIMIT 1", (rn,))
+            rr = cur.fetchone()
+            if rr:
+                role_id = rr[0]
+                cur.execute("INSERT INTO user_roles (user_id, role_id, enabled, verified) VALUES (%s,%s,1,1)", (uid, role_id))
+        conn.commit()
+        return uid
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("DB error", str(e)); return None
+    finally:
+        cur.close(); conn.close()
+
+def find_user_by_phone(phone):
+    conn = get_conn()
+    if not conn: return None
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM users WHERE phone=%s", (phone,))
+    r = cur.fetchone()
+    cur.close(); conn.close()
+    return r
+
+def set_user_password(phone, hashed_pw):
+    conn = get_conn()
+    if not conn: return False
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET password_hash=%s, phone_verified=1 WHERE phone=%s", (hashed_pw, phone))
+        conn.commit(); return True
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("DB error", str(e)); return False
+    finally:
+        cur.close(); conn.close()
+
+def get_user_roles(user_id):
+    conn = get_conn()
+    if not conn: return []
+    cur = conn.cursor()
+    cur.execute("""SELECT r.role_name, ur.enabled, ur.verified
+                   FROM user_roles ur JOIN roles r ON ur.role_id=r.role_id
+                   WHERE ur.user_id=%s""", (user_id,))
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return rows
+
+def upload_graphic_id(user_id, src_path):
+    fname = os.path.basename(src_path)
+    if not any(x in fname.lower() for x in ('geu','graphic','rdlc')):
+        messagebox.showerror("Upload failed", "Filename must include GEU / Graphic / RDLC (case-insensitive)")
+        return False
+    if not os.path.splitext(fname)[1].lower() in ALLOWED_UPLOAD_EXT:
+        messagebox.showerror("Upload failed", "Only PDF files allowed")
+        return False
+    if not filesize_ok(src_path):
+        messagebox.showerror("Upload failed", "File exceeds 5 MB limit")
+        return False
+    try:
+        dest_dir = os.path.join(UPLOAD_DIR, f"user_{user_id}")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest_path = os.path.join(dest_dir, f"{int(datetime.utcnow().timestamp())}_{fname}")
+        copy2(src_path, dest_path)
+    except Exception as e:
+        messagebox.showerror("Upload failed", str(e)); return False
+    conn = get_conn()
+    if not conn: return False
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET id_doc_url=%s, id_status='Approved' WHERE user_id=%s", (dest_path, user_id))
+        cur.execute("INSERT INTO verification (user_id, type, status, admin_id, notes) VALUES (%s,%s,%s,%s,%s)",
+                    (user_id, 'ID', 'Approved', 0, 'Auto-approved'))
+        cur.execute("""UPDATE user_roles ur JOIN roles r ON ur.role_id=r.role_id
+                       SET ur.enabled=1, ur.verified=1
+                       WHERE ur.user_id=%s AND r.role_name='Driver'""", (user_id,))
+        conn.commit()
+        open_file_with_default(dest_path)
+        return True
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("Upload failed", str(e)); return False
+    finally:
+        cur.close(); conn.close()
+
+def post_driver_availability(user_id, slot_date, start_time, end_time, seats, vehicle_info, only_female):
+    conn = get_conn()
+    if not conn: return False
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO driver_availability (user_id, date, start_time, end_time, seats, vehicle_info, slot_date, slot_time) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (user_id, slot_date, start_time, end_time, seats, vehicle_info, slot_date, f"{start_time}-{end_time}"))
+        conn.commit(); return True
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("DB error", str(e)); return False
+    finally:
+        cur.close(); conn.close()
+
+def get_drivers_for_date(slot_date, only_female_pref=False):
+    conn = get_conn()
+    if not conn: return []
+    cur = conn.cursor(dictionary=True)
+    try:
+        if only_female_pref:
+            cur.execute("""SELECT da.id as avail_id, da.user_id, u.name, u.gender, da.start_time, da.end_time, da.slot_time
+                           FROM driver_availability da JOIN users u ON da.user_id=u.user_id
+                           WHERE da.date=%s AND u.gender='Female'""", (slot_date,))
+        else:
+            cur.execute("""SELECT da.id as avail_id, da.user_id, u.name, u.gender, da.start_time, da.end_time, da.slot_time
+                           FROM driver_availability da JOIN users u ON da.user_id=u.user_id
+                           WHERE da.date=%s""", (slot_date,))
+        rows = cur.fetchall(); return rows
+    except Exception as e:
+        messagebox.showerror("DB error", str(e)); return []
+    finally:
+        cur.close(); conn.close()
+
+def create_booking_and_txn(rider_id, driver_id, availability_id, pickup, dropoff, pax, female_only, amount, rider_upi):
+    conn = get_conn()
+    if not conn: return None
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO bookings (rider_id, driver_id, availability_id, pickup, dropoff, pax, female_only, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (rider_id, driver_id, availability_id, pickup, dropoff, pax, female_only, 'Pending'))
+        booking_id = cur.lastrowid
+        tr_id = gen_tr_id()
+        cur.execute("INSERT INTO tr_details (ID, Name, UPI_ID, AMT, Date, Status, rider_id, driver_id, amount, rider_upi, driver_received) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (tr_id, 'Booking:'+str(booking_id), rider_upi, amount, datetime.utcnow(), 'Pending', rider_id, driver_id, amount, rider_upi, 0.00))
+        conn.commit()
+        return tr_id
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("DB error", str(e)); return None
+    finally:
+        cur.close(); conn.close()
+
+def mark_txn_result(tr_id, success, payer_upi, driver_id=None, amount=None):
+    conn = get_conn()
+    if not conn: return False
+    cur = conn.cursor()
+    try:
+        status = 'Success' if success else 'Failed'
+        cur.execute("UPDATE tr_details SET Status=%s WHERE ID=%s", (status, tr_id))
+        if success:
+            cur.execute("INSERT INTO payments (tr_id, payer_upi, driver_id, amount, status) VALUES (%s,%s,%s,%s,%s)",
+                        (tr_id, payer_upi, driver_id, amount, 'Completed'))
+            if driver_id and amount:
+                driver_share = float(amount) * 0.85
+                cur.execute("UPDATE tr_details SET driver_received=%s WHERE ID=%s", (driver_share, tr_id))
+        conn.commit(); return True
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("DB error", str(e)); return False
+    finally:
+        cur.close(); conn.close()
+
+def get_transactions_by_upi(upi):
+    conn = get_conn()
+    if not conn: return []
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM tr_details WHERE UPI_ID=%s ORDER BY created_at DESC", (upi,))
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return rows
+
+def get_user_by_id(uid):
+    conn = get_conn()
+    if not conn: return None
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM users WHERE user_id=%s", (uid,))
+    r = cur.fetchone(); cur.close(); conn.close()
+    return r
+
+def list_users_for_switch():
+    conn = get_conn()
+    if not conn: return []
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, name, phone FROM users ORDER BY name")
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return rows
+
+def get_my_bookings(user_id, role):
+    conn = get_conn()
+    if not conn: return []
+    cur = conn.cursor(dictionary=True)
+    if role == 'Rider':
+        cur.execute("SELECT * FROM bookings WHERE rider_id=%s ORDER BY created_at DESC", (user_id,))
+    else:
+        cur.execute("SELECT * FROM bookings WHERE driver_id=%s ORDER BY created_at DESC", (user_id,))
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return rows
+
+def submit_feedback(user_id, role, q_overall, q_safety, q_payment, notes):
+    conn = get_conn()
+    if not conn: return False
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO feedback (user_id, role, overall, safety, payment_exp, notes, from_user, for_role) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (user_id, role, q_overall, q_safety, q_payment, notes, user_id, role))
+        conn.commit(); return True
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("DB error", str(e)); return False
+    finally:
+        cur.close(); conn.close()
+
+# ---------- GUI App ----------
+class SmartShareApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("SmartShare — Secure & Smart (v4) - fixed")
+        root.geometry("1024x720")
+        root.configure(bg=BG)
+
+        self.session = {
+            'user_id': None,
+            'active_role': None,
+            'upi_session': None,
+            'upi_pin_hash': None
+        }
+
+        # create frames
+        self.frames = {}
+        for F in (HomeFrame, RegisterFrame, VerifyFrame, LoginFrame, DashboardFrame,
+                  UploadIDFrame, PostAvailabilityFrame, BookRideFrame,
+                  PaymentsStep1Frame, PaymentsStep2Frame,
+                  ViewPaymentsFrame, SwitchAccountFrame, ManageBookingsFrame, FeedbackFrame):
+            page = F(self)
+            name = getattr(F, "_name_", F.__name__)
+            self.frames[name] = page
+            page.frame.place(relx=0.02, rely=0.02, relwidth=0.96, relheight=0.96)
+
+        self.show('HomeFrame')
+
+    def show(self, name):
+        for f in self.frames.values():
+            try:
+                f.frame.lower()
+            except Exception:
+                pass
+        page = self.frames.get(name)
+        if page:
+            page.frame.lift()
+            if hasattr(page, 'on_show'):
+                try:
+                    page.on_show()
+                except Exception as e:
+                    print("on_show error:", e)
+
+    def require_login(self):
+        if not self.session.get('user_id'):
+            messagebox.showinfo("Login required", "Please login or register first.")
+            self.show('LoginFrame')
+            return False
+        return True
+
+# ---------- Frames ----------
+class HomeFrame:
+    _name_ = 'HomeFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="SmartShare — Secure & Smart", font=("Helvetica", 30, "bold"), bg=BG, fg=TEXT).pack(pady=20)
+        btn_frame = tk.Frame(f, bg=BG); btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="Register", bg=PRIMARY, fg='white', width=18, command=lambda: app.show('RegisterFrame')).grid(row=0, column=0, padx=10, pady=6)
+        tk.Button(btn_frame, text="Login", bg='#2E8BFF', fg='white', width=18, command=lambda: app.show('LoginFrame')).grid(row=0, column=1, padx=10, pady=6)
+        # Calendar removed from starting page as requested
+        tk.Button(btn_frame, text="Exit", bg='lightgrey', width=18, command=app.root.quit).grid(row=1, column=1, padx=10, pady=6)
+
+class RegisterFrame:
+    _name_ = 'RegisterFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="Register", font=("Helvetica", 24, "bold"), bg=BG).pack(pady=10)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(pady=10, padx=10)
+        tk.Label(card, text="Name:", bg=CARD).grid(row=0, column=0, sticky='w', padx=10, pady=6)
+        self.name_e = tk.Entry(card, width=30); self.name_e.grid(row=0, column=1, padx=10, pady=6)
+        tk.Label(card, text="Phone:", bg=CARD).grid(row=1, column=0, sticky='w', padx=10, pady=6)
+        self.phone_e = tk.Entry(card, width=30); self.phone_e.grid(row=1, column=1, padx=10, pady=6)
+        tk.Label(card, text="Gender:", bg=CARD).grid(row=2, column=0, sticky='w', padx=10, pady=6)
+        self.gender_cb = ttk.Combobox(card, values=["Female","Male","Other"], state='readonly'); self.gender_cb.current(0); self.gender_cb.grid(row=2,column=1,padx=10,pady=6)
+        tk.Label(card, text="Choose roles (Ctrl+click)", bg=CARD).grid(row=3, column=0, sticky='w', padx=10, pady=6)
+        self.roles_lb = tk.Listbox(card, selectmode='extended', exportselection=0, height=3); self.roles_lb.insert('end','Rider'); self.roles_lb.insert('end','Driver'); self.roles_lb.grid(row=3, column=1, padx=10, pady=6)
+        # --- NEW: TOTP opt-in ---
+        self.totp_var = tk.IntVar()
+        tk.Checkbutton(card, text="Enable TOTP (2FA)", variable=self.totp_var, bg=CARD).grid(row=4, column=0, columnspan=2, pady=6)
+        tk.Button(card, text="Register & Send OTP (demo)", bg=PRIMARY, fg='white', command=self.do_register).grid(row=5, column=0, columnspan=2, pady=10)
+        tk.Button(card, text="Back", bg=SECOND, fg='white', command=lambda: app.show('HomeFrame')).grid(row=6, column=0, columnspan=2, pady=6)
+
+    def do_register(self):
+        name = self.name_e.get().strip(); phone = self.phone_e.get().strip(); gender = self.gender_cb.get()
+        sel = [self.roles_lb.get(i) for i in self.roles_lb.curselection()]
+        if not name or not phone or not sel:
+            messagebox.showwarning("Missing", "Please fill name, phone and at least one role."); return
+        totp_secret = None
+        if self.totp_var.get():
+            if pyotp:
+                totp_secret = pyotp.random_base32()
+            else:
+                totp_secret = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
+        uid = insert_user(name, phone, gender, sel, totp_secret=totp_secret)
+        if uid:
+            if totp_secret:
+                # show TOTP enrollment popup (guaranteed)
+                self.show_totp_qr(name, phone, totp_secret)
+            messagebox.showinfo("Registered", "User created. Proceed to Verify & Set Password.")
+            self.app.show('VerifyFrame')
+
+    def show_totp_qr(self, name, phone, secret):
+        """
+        Always open a Toplevel window showing the TOTP secret.
+        If qrcode & PIL present, show the QR image (scannable).
+        Otherwise show the secret in text with instructions.
+        """
+        issuer = "SmartShare"
+        user_label = f"{name}_{phone}"
+        uri = f"otpauth://totp/{issuer}:{user_label}?secret={secret}&issuer={issuer}&algorithm=SHA1&digits=6&period=30"
+
+        top = tk.Toplevel(self.app.root)
+        top.title("TOTP enrollment")
+        top.configure(bg=BG)
+        # make modal-like
+        top.transient(self.app.root)
+        try:
+            top.grab_set()
+        except Exception:
+            pass
+
+        tk.Label(top, text="Scan this QR with your Authenticator app OR copy the secret below", bg=BG, font=("Helvetica", 12)).pack(pady=8)
+        qr_frame = tk.Frame(top, bg=BG); qr_frame.pack(padx=10, pady=8)
+
+        if qrcode and Image:
+            try:
+                img = qrcode.make(uri)
+                img.thumbnail((260,260))
+                tkimg = ImageTk.PhotoImage(img)
+                lbl = tk.Label(qr_frame, image=tkimg, bg=BG)
+                lbl.image = tkimg
+                lbl.pack()
+            except Exception as e:
+                # fallback to text secret
+                tk.Label(qr_frame, text="(QR generation failed — see secret below)", bg=BG).pack()
+        else:
+            tk.Label(qr_frame, text="(QR not available — install 'qrcode' and 'Pillow' for QR)", bg=BG).pack()
+
+        secret_lbl = tk.Label(top, text=f"TOTP secret: {secret}", bg=BG, font=("Courier", 11))
+        secret_lbl.pack(pady=8, padx=10)
+
+        instr = "Open your authenticator app (Google/Authy), choose add account → Enter secret or scan QR, then enter the 6-digit TOTP during login."
+        tk.Message(top, text=instr, width=420, bg=BG).pack(padx=10, pady=6)
+
+        def closeme():
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            top.destroy()
+
+        tk.Button(top, text="I scanned it / understood", bg=SECOND, fg='white', command=closeme).pack(pady=10)
+        # ensure top is visible and focused
+        top.lift(); top.focus_force()
+
+class VerifyFrame:
+    _name_ = 'VerifyFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="Verify Phone & Set Password", font=("Helvetica", 22, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(padx=10, pady=10)
+        tk.Label(card, text="Phone:", bg=CARD).grid(row=0,column=0,sticky='w', padx=8, pady=6)
+        self.phone_e = tk.Entry(card, width=30); self.phone_e.grid(row=0,column=1, padx=8, pady=6)
+        tk.Label(card, text="OTP (demo):", bg=CARD).grid(row=1,column=0, sticky='w', padx=8, pady=6)
+        self.otp_e = tk.Entry(card, width=30); self.otp_e.grid(row=1,column=1, padx=8, pady=6)
+        tk.Label(card, text="Password:", bg=CARD).grid(row=2,column=0, sticky='w', padx=8, pady=6)
+        self.p1 = tk.Entry(card, width=30, show='*'); self.p1.grid(row=2,column=1, padx=8, pady=6)
+        tk.Label(card, text="Confirm Password:", bg=CARD).grid(row=3,column=0, sticky='w', padx=8, pady=6)
+        self.p2 = tk.Entry(card, width=30, show='*'); self.p2.grid(row=3,column=1, padx=8, pady=6)
+        tk.Button(card, text="Verify & Set Password", bg=PRIMARY, fg='white', command=self.do_set).grid(row=4,column=0,columnspan=2,pady=10)
+        tk.Button(card, text="Back", bg=SECOND, fg='white', command=lambda: app.show('HomeFrame')).grid(row=5,column=0,columnspan=2,pady=6)
+
+    def do_set(self):
+        phone=self.phone_e.get().strip(); otp=self.otp_e.get().strip(); pw1=self.p1.get().strip(); pw2=self.p2.get().strip()
+        if not phone or not otp: messagebox.showwarning("Missing", "Enter phone and OTP (demo)."); return
+        if pw1!=pw2 or len(pw1)<6: messagebox.showwarning("Password", "Passwords must match and be >=6 chars"); return
+        if set_user_password(phone, hash_pin(pw1)):
+            messagebox.showinfo("Success", "Verification and password set. You can login now."); self.app.show('LoginFrame')
+
+class LoginFrame:
+    _name_ = 'LoginFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="Login", font=("Helvetica", 24, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(padx=10, pady=8)
+        tk.Label(card, text="Phone:", bg=CARD).grid(row=0,column=0, sticky='w', padx=8, pady=6)
+        self.phone_e = tk.Entry(card, width=30); self.phone_e.grid(row=0,column=1,padx=8,pady=6)
+        tk.Label(card, text="Password:", bg=CARD).grid(row=1,column=0, sticky='w', padx=8, pady=6)
+        self.pw_e = tk.Entry(card, show='*', width=30); self.pw_e.grid(row=1,column=1,padx=8,pady=6)
+        tk.Label(card, text="TOTP (if enrolled)", bg=CARD).grid(row=2,column=0, sticky='w', padx=8, pady=6)
+        self.totp_e = tk.Entry(card, width=20); self.totp_e.grid(row=2,column=1,padx=8,pady=6, sticky='w')
+        tk.Button(card, text="Login", bg=PRIMARY, fg='white', command=self.do_login).grid(row=3, column=0, columnspan=2, pady=10)
+        tk.Button(card, text="Back", bg=SECOND, fg='white', command=lambda: app.show('HomeFrame')).grid(row=4, column=0, columnspan=2, pady=6)
+
+    def do_login(self):
+        phone = self.phone_e.get().strip(); pw = self.pw_e.get().strip()
+        if not phone or not pw: messagebox.showwarning("Missing", "Enter phone and password"); return
+        user = find_user_by_phone(phone)
+        if not user: messagebox.showerror("Login failed", "User not found"); return
+        if not user.get('password_hash') or user.get('password_hash') != hash_pin(pw):
+            messagebox.showerror("Login failed", "Wrong password or not set"); return
+        if user.get('totp_secret'):
+            if not pyotp:
+                messagebox.showwarning("TOTP lib missing", "This account has TOTP but pyotp library is not installed; bypassing TOTP check.")
+            else:
+                code = self.totp_e.get().strip()
+                if not code:
+                    messagebox.showerror("TOTP required", "Enter TOTP code"); return
+                t = pyotp.TOTP(user.get('totp_secret'))
+                if not t.verify(code):
+                    messagebox.showerror("TOTP failed", "Invalid TOTP code"); return
+        self.app.session['user_id'] = user['user_id']
+        roles = get_user_roles(user['user_id'])
+        chosen = None
+        for rname, enabled, verified in roles:
+            if rname == 'Rider' and enabled:
+                chosen = 'Rider'; break
+        if not chosen:
+            for rname, enabled, verified in roles:
+                if enabled:
+                    chosen = rname; break
+        self.app.session['active_role'] = chosen
+        messagebox.showinfo("Welcome", f"Logged in as {user['name']}. Active role: {chosen}")
+        self.app.show('DashboardFrame')
+
+class DashboardFrame:
+    _name_ = 'DashboardFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="Dashboard", font=("Helvetica", 26, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(pady=10, padx=10)
+        left = tk.Frame(card, bg=CARD); left.grid(row=0,column=0,padx=20,pady=10)
+        right = tk.Frame(card, bg=CARD); right.grid(row=0,column=1,padx=20,pady=10)
+        tk.Button(left, text="Post Availability (Driver)", bg=PRIMARY, width=24, command=lambda: app.show('PostAvailabilityFrame')).pack(pady=6)
+        tk.Button(left, text="My Bookings", bg=SECOND, width=24, command=lambda: app.show('ManageBookingsFrame')).pack(pady=6)
+        tk.Button(left, text="Upload Graphic Era ID", bg='#7b2fc2', fg='white', width=24, command=lambda: app.show('UploadIDFrame')).pack(pady=6)
+        tk.Button(left, text="View Payments", bg='#6b4b3a', fg='white', width=24, command=lambda: app.show('ViewPaymentsFrame')).pack(pady=6)
+        tk.Button(left, text="Switch Account", bg='#5C677D', fg='white', width=24, command=lambda: app.show('SwitchAccountFrame')).pack(pady=6)
+        tk.Button(right, text="Search & Book (Rider)", bg='#2E8BFF', fg='white', width=24, command=lambda: app.show('BookRideFrame')).pack(pady=6)
+        tk.Button(right, text="Manage Bookings (Driver)", bg='#2E8BFF', fg='white', width=24, command=lambda: app.show('ManageBookingsFrame')).pack(pady=6)
+        tk.Button(right, text="Payments (Stepwise)", bg=ACCENT, fg='white', width=24, command=lambda: app.show('PaymentsStep1Frame')).pack(pady=6)
+        tk.Button(right, text="Feedback ✨", bg=PRIMARY, fg='white', width=24, command=lambda: app.show('FeedbackFrame')).pack(pady=6)
+        tk.Button(f, text="Logout", bg='#E74C3C', fg='white', command=self.logout).pack(pady=8)
+    def logout(self):
+        self.app.session = {'user_id': None, 'active_role': None, 'upi_session': None, 'upi_pin_hash': None}
+        messagebox.showinfo("Logged out", "You have been logged out."); self.app.show('HomeFrame')
+
+class UploadIDFrame:
+    _name_ = 'UploadIDFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="Upload Graphic Era ID (PDF only)", font=("Helvetica", 22, "bold"), bg=BG).pack(pady=8)
+        tk.Label(f, text="Max 5 MB. Filename must include GEU / Graphic / RDLC", bg=BG).pack()
+        self.btn = tk.Button(f, text="Choose PDF and Upload", bg=ACCENT, fg='white', command=self.choose_and_upload)
+        self.btn.pack(pady=30)
+        self.prog = ttk.Progressbar(f, orient='horizontal', length=320, mode='determinate')
+        self.prog.pack(pady=8)
+        self.prog_lbl = tk.Label(f, text="", bg=BG); self.prog_lbl.pack()
+        tk.Button(f, text="Back", bg=SECOND, fg='white', command=lambda: app.show('DashboardFrame')).pack()
+
+    def choose_and_upload(self):
+        if not self.app.require_login(): return
+        uid = self.app.session['user_id']
+        path = filedialog.askopenfilename(title="Select PDF", filetypes=[("PDF files","*.pdf")])
+        if not path: return
+        self.btn.config(state='disabled')
+        self.prog['value'] = 0; self.prog_lbl.config(text="Starting...")
+        self.frame.update_idletasks()
+        self._simulate_progress(uid, path, 0)
+
+    def _simulate_progress(self, uid, path, step):
+        steps = 8
+        if step < steps:
+            self.prog['value'] = (step+1)*(100/steps)
+            self.prog_lbl.config(text=f"Uploading... {int(self.prog['value'])}%")
+            self.frame.update_idletasks()
+            self.frame.after(180, lambda: self._simulate_progress(uid, path, step+1))
+        else:
+            self._finish_upload(uid, path)
+
+    def _finish_upload(self, uid, path):
+        ok = upload_graphic_id(uid, path)
+        if ok:
+            self.prog_lbl.config(text="Upload successful ✅")
+            messagebox.showinfo("Uploaded", "ID uploaded and auto-approved (admin_id=0). The PDF will open in your default viewer.")
+            self.app.show('DashboardFrame')
+        else:
+            self.prog_lbl.config(text="Upload failed ❌")
+        self.btn.config(state='normal')
+        self.prog['value'] = 0
+
+class PostAvailabilityFrame:
+    _name_ = 'PostAvailabilityFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="Post Availability (Driver) — up to 2 days", font=("Helvetica", 20, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(padx=10,pady=10)
+        tk.Label(card, text="Select slot (today / tomorrow / +2):", bg=CARD).grid(row=0,column=0, padx=8, pady=6, sticky='w')
+        self.slot_var = tk.StringVar(); base = date.today()
+        opts = [base.strftime("%Y-%m-%d"), (base+timedelta(days=1)).strftime("%Y-%m-%d"), (base+timedelta(days=2)).strftime("%Y-%m-%d")]
+        self.slot_cb = ttk.Combobox(card, values=opts, state='readonly', textvariable=self.slot_var); self.slot_cb.current(0); self.slot_cb.grid(row=0,column=1,padx=8,pady=6)
+        tk.Label(card, text="Start time (HH:MM):", bg=CARD).grid(row=1,column=0, sticky='w', padx=8, pady=6)
+        self.start_e = tk.Entry(card); self.start_e.insert(0,"08:00"); self.start_e.grid(row=1,column=1,padx=8,pady=6)
+        tk.Label(card, text="End time (HH:MM):", bg=CARD).grid(row=2,column=0, sticky='w', padx=8, pady=6)
+        self.end_e = tk.Entry(card); self.end_e.insert(0,"10:00"); self.end_e.grid(row=2,column=1,padx=8,pady=6)
+        tk.Label(card, text="Seats:", bg=CARD).grid(row=3,column=0, sticky='w', padx=8, pady=6)
+        self.seats_e = tk.Entry(card); self.seats_e.insert(0,"3"); self.seats_e.grid(row=3,column=1,padx=8,pady=6)
+        tk.Label(card, text="Vehicle info (optional):", bg=CARD).grid(row=4,column=0, sticky='w', padx=8, pady=6)
+        self.veh_e = tk.Entry(card); self.veh_e.grid(row=4,column=1,padx=8,pady=6)
+        self.only_female_var = tk.IntVar(); tk.Checkbutton(card, text="Only female riders", variable=self.only_female_var, bg=CARD).grid(row=5,column=0,columnspan=2)
+        tk.Button(card, text="Post Availability", bg=PRIMARY, fg='white', command=self.do_post).grid(row=6,column=0,columnspan=2,pady=10)
+        tk.Button(card, text="Back", bg=SECOND, fg='white', command=lambda: app.show('DashboardFrame')).grid(row=7,column=0,columnspan=2,pady=6)
+
+    def do_post(self):
+        if not self.app.require_login(): return
+        uid = self.app.session['user_id']; slot_date = self.slot_var.get()
+        start = self.start_e.get().strip(); end = self.end_e.get().strip()
+        seats = int(self.seats_e.get().strip() or 1); veh = self.veh_e.get().strip()
+        only_f = 1 if self.only_female_var.get() else 0
+        ok = post_driver_availability(uid, slot_date, start, end, seats, veh, only_f)
+        if ok:
+            messagebox.showinfo("Posted", "Availability posted for " + slot_date)
+            self.app.show('DashboardFrame')
+
+class BookRideFrame:
+    _name_ = 'BookRideFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="Book a Ride — choose date slot", font=("Helvetica", 22, "bold"), bg=BG).pack(pady=6)
+        left = tk.Frame(f, bg=BG); left.pack(side='left', padx=20, pady=10, fill='y')
+        right = tk.Frame(f, bg=BG); right.pack(side='left', padx=20, pady=10, fill='both', expand=1)
+        tk.Label(left, text="Select date:", bg=BG).pack(pady=6)
+        self.dates_lb = tk.Listbox(left, height=5); self.dates_lb.pack()
+        base = date.today(); self.dates = [base, base+timedelta(days=1), base+timedelta(days=2)]
+        for d in self.dates: self.dates_lb.insert('end', d.strftime("%Y-%m-%d"))
+        self.dates_lb.bind("<<ListboxSelect>>", self.on_date_sel)
+        tk.Label(right, text="Select driver (from available list after selecting date)", bg=BG).pack(pady=6)
+        self.drivers_lb = tk.Listbox(right, height=8); self.drivers_lb.pack(fill='x', padx=6)
+        tk.Label(right, text="Amount (₹):", bg=BG).pack(pady=6); self.amt_e = tk.Entry(right); self.amt_e.insert(0,"100"); self.amt_e.pack()
+        tk.Label(right, text="Your UPI id (for demo):", bg=BG).pack(pady=6); self.upi_e = tk.Entry(right); self.upi_e.insert(0,"abc@sbi"); self.upi_e.pack()
+        tk.Label(right, text="UPI PIN (session only):", bg=BG).pack(pady=6); self.pin_e = tk.Entry(right, show='*'); self.pin_e.pack()
+        tk.Button(right, text="Load Drivers", bg=ACCENT, fg='white', command=self.on_date_sel).pack(pady=6)
+        tk.Button(right, text="Book (creates pending txn)", bg=SECOND, fg='white', command=self.do_book).pack(pady=6)
+        tk.Button(right, text="Back", bg='#444', fg='white', command=lambda: app.show('DashboardFrame')).pack(pady=10)
+        self.available = []
+
+    def on_date_sel(self, evt=None):
+        sel = self.dates_lb.curselection()
+        if not sel: return
+        idx = sel[0]; slot_date = self.dates[idx].strftime("%Y-%m-%d")
+        rows = get_drivers_for_date(slot_date)
+        self.drivers_lb.delete(0,'end'); self.available = []
+        for r in rows:
+            aid = r.get('avail_id'); uid=r.get('user_id'); name=r.get('name'); slot=r.get('slot_time') or f"{r.get('start_time')}-{r.get('end_time')}"
+            self.available.append((aid, uid, name, slot)); self.drivers_lb.insert('end', f"{uid} | {name} | {slot}")
+
+    def do_book(self):
+        if not self.app.require_login(): return
+        sel = self.drivers_lb.curselection()
+        if not sel: messagebox.showwarning("Select", "Select a driver"); return
+        idx = sel[0]; avail = self.available[idx]; avail_id, driver_id, dname, slot = avail
+        rider_id = self.app.session['user_id']
+        try:
+            amount = float(self.amt_e.get().strip())
+        except:
+            messagebox.showwarning("Amount", "Enter valid amount"); return
+        upi = self.upi_e.get().strip(); pin = self.pin_e.get().strip()
+        if not pin or len(pin)!=4 or not pin.isdigit():
+            messagebox.showwarning("PIN", "Enter 4-digit PIN for session"); return
+        self.app.session['upi_session'] = upi; self.app.session['upi_pin_hash'] = hash_pin(pin)
+        tr_id = create_booking_and_txn(rider_id, driver_id, avail_id, None, None, 1, 0, amount, upi)
+        if tr_id:
+            messagebox.showinfo("Pending", f"Booking created and transaction pending. TXN ID: {tr_id}\nYou will be reminded to pay shortly.")
+            self.app.root.after(PAYMENT_REMINDER_MS, lambda: self.remind_payment(tr_id))
+            self.app.show('DashboardFrame')
+
+    def remind_payment(self, tr_id):
+        if messagebox.askyesno("Payment reminder", "Your booking is pending payment. Proceed to pay now?"):
+            p2 = self.app.frames['PaymentsStep2Frame']
+            # set entry content safely
+            try:
+                p2.trid_e.delete(0,'end'); p2.trid_e.insert(0, tr_id)
+            except Exception:
+                pass
+            self.app.show('PaymentsStep2Frame')
+
+class PaymentsStep1Frame:
+    _name_ = 'PaymentsStep1Frame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame = f
+        tk.Label(f, text="Payments — Step 1: Save UPI (session)", font=("Helvetica", 22, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(padx=10,pady=10)
+        tk.Label(card, text="Name (for receipts)", bg=CARD).grid(row=0,column=0,padx=8,pady=6,sticky='w')
+        self.name_e = tk.Entry(card, width=30); self.name_e.grid(row=0,column=1,padx=8,pady=6)
+        tk.Label(card, text="UPI ID (e.g., alice@upi)", bg=CARD).grid(row=1,column=0,padx=8,pady=6,sticky='w')
+        self.upi_e = tk.Entry(card, width=30); self.upi_e.grid(row=1,column=1,padx=8,pady=6)
+        tk.Label(card, text="Set 4-digit UPI PIN", bg=CARD).grid(row=2,column=0,padx=8,pady=6,sticky='w')
+        self.pin_e = tk.Entry(card, width=10, show='*'); self.pin_e.grid(row=2,column=1,padx=8,pady=6,sticky='w')
+        tk.Label(card, text="Initial balance (demo, INR)", bg=CARD).grid(row=3,column=0,padx=8,pady=6,sticky='w')
+        self.bal_e = tk.Entry(card, width=12); self.bal_e.insert(0,"1000"); self.bal_e.grid(row=3,column=1,padx=8,pady=6,sticky='w')
+        tk.Button(card, text="Save & Continue", bg=PRIMARY, fg='white', command=self.save_upi).grid(row=4,column=0,columnspan=2,pady=10)
+        tk.Button(card, text="Back", bg=SECOND, fg='white', command=lambda: app.show('DashboardFrame')).grid(row=5,column=0,columnspan=2,pady=6)
+
+    def on_show(self):
+        uid = self.app.session.get('user_id')
+        if uid:
+            u = get_user_by_id(uid)
+            if u:
+                self.name_e.delete(0,'end'); self.name_e.insert(0, u.get('name'))
+
+    def save_upi(self):
+        upi = self.upi_e.get().strip(); pin = self.pin_e.get().strip()
+        if not upi or not pin or len(pin)!=4 or not pin.isdigit():
+            messagebox.showwarning("Missing", "Enter UPI and a 4-digit PIN"); return
+        self.app.session['upi_session'] = upi
+        self.app.session['upi_pin_hash'] = hash_pin(pin)
+        messagebox.showinfo("Saved", "UPI saved in session. Continue to Make Payment.")
+        self.app.show('PaymentsStep2Frame')
+
+class PaymentsStep2Frame:
+    _name_ = 'PaymentsStep2Frame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame=f
+        tk.Label(f, text="Payments — Step 2: Make payment", font=("Helvetica", 22, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(padx=10,pady=10)
+        tk.Label(card, text="Transaction ID (optional - leave blank to pay new booking txn)", bg=CARD).grid(row=0,column=0,columnspan=2,padx=8,pady=6)
+        self.trid_e = tk.Entry(card, width=40); self.trid_e.grid(row=1,column=0,columnspan=2,padx=8,pady=6)
+        tk.Label(card, text="UPI (session)", bg=CARD).grid(row=2,column=0, sticky='w', padx=8, pady=6)
+        self.upi_e = tk.Entry(card, width=30); self.upi_e.grid(row=2,column=1,padx=8,pady=6)
+        tk.Label(card, text="Amount (INR)", bg=CARD).grid(row=3,column=0, sticky='w', padx=8, pady=6)
+        self.amt_e = tk.Entry(card, width=20); self.amt_e.grid(row=3,column=1,padx=8,pady=6)
+        tk.Label(card, text="Enter UPI PIN:", bg=CARD).grid(row=4,column=0, sticky='w', padx=8, pady=6)
+        self.pin_e = tk.Entry(card, width=20, show='*'); self.pin_e.grid(row=4,column=1,padx=8,pady=6)
+        tk.Button(card, text="Make Payment", bg=PRIMARY, fg='white', command=self.do_payment).grid(row=5,column=0,columnspan=2,pady=10)
+        tk.Button(card, text="Back", bg=SECOND, fg='white', command=lambda: app.show('DashboardFrame')).grid(row=6,column=0,columnspan=2,pady=6)
+
+    def on_show(self):
+        upi = self.app.session.get('upi_session')
+        if upi:
+            self.upi_e.delete(0,'end'); self.upi_e.insert(0, upi)
+
+    def do_payment(self):
+        tr_id = self.trid_e.get().strip()
+        upi = self.upi_e.get().strip()
+        pin = self.pin_e.get().strip()
+        if not upi or not pin: messagebox.showwarning("Missing", "Enter UPI and PIN"); return
+        if self.app.session.get('upi_pin_hash') != hash_pin(pin):
+            messagebox.showerror("Failed", "PIN does not match session PIN"); return
+        if not tr_id:
+            messagebox.showinfo("No txn", "This flow expects to be called with a transaction ID created by booking. Create booking first.")
+            return
+        conn = get_conn()
+        if not conn: return
+        cur = conn.cursor(dictionary=True); cur.execute("SELECT * FROM tr_details WHERE ID=%s", (tr_id,)); tx = cur.fetchone(); cur.close(); conn.close()
+        if not tx:
+            messagebox.showerror("No txn", "Transaction not found"); return
+        if tx.get('Status') and str(tx.get('Status')).lower().startswith('success'):
+            messagebox.showinfo("Already", "Transaction already completed"); return
+        amt = float(self.amt_e.get().strip() or tx.get('AMT') or 0)
+        ok = mark_txn_result(tr_id, True, upi, driver_id=tx.get('driver_id'), amount=amt)
+        if ok:
+            messagebox.showinfo("Success", "Payment recorded successfully.")
+            self.app.show('FeedbackFrame')
+
+class ViewPaymentsFrame:
+    _name_ = 'ViewPaymentsFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame=f
+        tk.Label(f, text="View Payments (by UPI)", font=("Helvetica", 22, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(padx=10,pady=10)
+        tk.Label(card, text="UPI", bg=CARD).grid(row=0,column=0,padx=6,pady=6)
+        self.upi_e = tk.Entry(card); self.upi_e.grid(row=0,column=1,padx=6,pady=6)
+        tk.Label(card, text="PIN (session)", bg=CARD).grid(row=1,column=0,padx=6,pady=6)
+        self.pin_e = tk.Entry(card, show='*'); self.pin_e.grid(row=1,column=1,padx=6,pady=6)
+        tk.Button(card, text="View", bg=PRIMARY, fg='white', command=self.do_view).grid(row=2,column=0,padx=6,pady=10)
+        tk.Button(card, text="Back", bg=SECOND, fg='white', command=lambda: app.show('DashboardFrame')).grid(row=2,column=1,padx=6,pady=10)
+        self.res_lbl = tk.Label(f, text="No transactions", bg=BG); self.res_lbl.pack(pady=8)
+
+    def do_view(self):
+        upi = self.upi_e.get().strip(); pin = self.pin_e.get().strip()
+        if not upi or not pin: messagebox.showwarning("Missing", "Enter UPI and PIN"); return
+        if self.app.session.get('upi_pin_hash') != hash_pin(pin): messagebox.showerror("Failed", "PIN mismatch"); return
+        rows = get_transactions_by_upi(upi)
+        if not rows: self.res_lbl.config(text="No transactions")
+        else:
+            txt = "\n".join([f"{r.get('ID')} {r.get('Status')} ₹{r.get('AMT')}" for r in rows])
+            self.res_lbl.config(text=txt)
+
+class SwitchAccountFrame:
+    _name_ = 'SwitchAccountFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame=f
+        tk.Label(f, text="Switch Role/Account", font=("Helvetica", 24, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(padx=10,pady=10, fill='both', expand=1)
+        self.lb = tk.Listbox(card, width=60, height=10); self.lb.pack(side='left', padx=6, pady=6)
+        right = tk.Frame(card, bg=CARD); right.pack(side='left', padx=6, pady=6)
+        tk.Button(right, text="Refresh list", bg=PRIMARY, fg='white', command=self.load).pack(pady=6)
+        tk.Button(right, text="Switch to selected", bg='#2E8BFF', fg='white', command=self.do_switch).pack(pady=6)
+        tk.Button(right, text="Back", bg=SECOND, fg='white', command=lambda: app.show('DashboardFrame')).pack(pady=6)
+        self.load()
+
+    def load(self):
+        self.lb.delete(0,'end'); rows = list_users_for_switch()
+        for r in rows: self.lb.insert('end', f"{r[0]}: {r[1]} ({r[2]})")
+
+    def do_switch(self):
+        sel = self.lb.curselection()
+        if not sel: messagebox.showwarning("Select", "Pick an account to switch to"); return
+        idx = sel[0]; txt = self.lb.get(idx); uid = int(txt.split(':')[0])
+        user = get_user_by_id(uid)
+        if not user: messagebox.showerror("DB error", "User not found"); return
+        roles = get_user_roles(uid)
+        chosen = None
+        for rname, enabled, verified in roles:
+            if rname == 'Rider' and enabled:
+                chosen = 'Rider'; break
+        if not chosen and roles:
+            chosen = roles[0][0]
+        self.app.session['user_id'] = uid; self.app.session['active_role'] = chosen
+        messagebox.showinfo("Switched", f"Switched to {user.get('name')} (id {uid}) — active role: {chosen}")
+        self.app.show('DashboardFrame')
+
+class ManageBookingsFrame:
+    _name_ = 'ManageBookingsFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame=f
+        tk.Label(f, text="Manage / My Bookings", font=("Helvetica", 22, "bold"), bg=BG).pack(pady=8)
+        self.lb = tk.Listbox(f, width=80, height=12); self.lb.pack(padx=10,pady=10)
+        tk.Button(f, text="Mark selected Completed", bg=PRIMARY, fg='white', command=self.mark_completed).pack(pady=6)
+        tk.Button(f, text="Back", bg=SECOND, fg='white', command=lambda: app.show('DashboardFrame')).pack(pady=6)
+    def on_show(self):
+        if not self.app.require_login(): return
+        uid = self.app.session['user_id']; role = self.app.session.get('active_role') or 'Rider'
+        rows = get_my_bookings(uid, role); self.lb.delete(0,'end')
+        if not rows: self.lb.insert('end', "No bookings for you.")
+        else:
+            for r in rows: self.lb.insert('end', f"{r.get('id')} | {r.get('status')} | rider:{r.get('rider_id')} driver:{r.get('driver_id')}")
+
+    def mark_completed(self):
+        sel = self.lb.curselection()
+        if not sel: return
+        txt = self.lb.get(sel[0])
+        if txt.startswith("No bookings"): return
+        bid = int(txt.split('|')[0].strip())
+        conn = get_conn(); cur = conn.cursor()
+        try:
+            cur.execute("UPDATE bookings SET status='Completed' WHERE id=%s", (bid,)); conn.commit(); messagebox.showinfo("Done", "Marked Completed"); self.on_show()
+        except Exception as e:
+            conn.rollback(); messagebox.showerror("DB error", str(e))
+        finally:
+            cur.close(); conn.close()
+
+class FeedbackFrame:
+    _name_ = 'FeedbackFrame'
+    def __init__(self, app):
+        self.app = app
+        f = tk.Frame(app.root, bg=BG); self.frame=f
+        tk.Label(f, text="Feedback ✨", font=("Helvetica", 22, "bold"), bg=BG).pack(pady=8)
+        card = tk.Frame(f, bg=CARD, bd=2, relief='groove'); card.pack(padx=10,pady=10)
+        tk.Label(card, text="Overall experience", bg=CARD).grid(row=0,column=0,padx=8,pady=6,sticky='w')
+        self.s1 = tk.Scale(card, from_=1, to=5, orient='horizontal'); self.s1.set(4); self.s1.grid(row=0,column=1,padx=6,pady=6)
+        tk.Label(card, text="Safety / comfort", bg=CARD).grid(row=1,column=0,padx=8,pady=6,sticky='w')
+        self.s2 = tk.Scale(card, from_=1, to=5, orient='horizontal'); self.s2.set(4); self.s2.grid(row=1,column=1,padx=6,pady=6)
+        tk.Label(card, text="Payment experience", bg=CARD).grid(row=2,column=0,padx=8,pady=6,sticky='w')
+        self.s3 = tk.Scale(card, from_=1, to=5, orient='horizontal'); self.s3.set(4); self.s3.grid(row=2,column=1,padx=6,pady=6)
+        tk.Label(card, text="Notes (optional)", bg=CARD).grid(row=3,column=0,padx=8,pady=6,sticky='nw')
+        self.notes = tk.Text(card, width=40, height=6); self.notes.grid(row=3,column=1,padx=6,pady=6)
+        tk.Button(card, text="Submit Feedback ✨", bg=PRIMARY, fg='white', command=self.do_submit).grid(row=4,column=0,pady=8)
+        tk.Button(card, text="Back", bg=SECOND, fg='white', command=lambda: app.show('DashboardFrame')).grid(row=4,column=1,pady=8)
+
+    def do_submit(self):
+        if not self.app.require_login(): return
+        uid = self.app.session['user_id']; role = self.app.session.get('active_role') or 'General'
+        ok = submit_feedback(uid, role, self.s1.get(), self.s2.get(), self.s3.get(), self.notes.get("1.0","end").strip())
+        if ok:
+            messagebox.showinfo("Thanks", "Feedback submitted ✨"); self.app.show('DashboardFrame')
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SmartShareApp(root)
+    root.mainloop()
