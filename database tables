@@ -1,0 +1,148 @@
+-- Use your database
+USE share_ride;
+
+-- 1. users
+CREATE TABLE IF NOT EXISTS users (
+  user_id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  phone VARCHAR(20) UNIQUE,
+  gender ENUM('Male','Female','Other') DEFAULT 'Other',
+  password_hash VARCHAR(255),
+  phone_verified TINYINT(1) DEFAULT 0,
+  id_doc_url VARCHAR(255),
+  id_status ENUM('Pending','Approved','Rejected') DEFAULT 'Pending',
+  totp_secret VARCHAR(128),
+  -- timestamps
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 2. roles
+CREATE TABLE IF NOT EXISTS roles (
+  role_id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  role_name VARCHAR(40) NOT NULL UNIQUE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Insert default roles if they don't exist (optional)
+INSERT IGNORE INTO roles (role_id, role_name) VALUES
+(1, 'Rider'), (2, 'Driver'), (3, 'Other');
+
+-- 3. user_roles (mapping)
+CREATE TABLE IF NOT EXISTS user_roles (
+  user_id INT NOT NULL,
+  role_id INT NOT NULL,
+  enabled TINYINT(1) DEFAULT 0,
+  verified TINYINT(1) DEFAULT 0,
+  PRIMARY KEY (user_id, role_id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+  FOREIGN KEY (role_id) REFERENCES roles(role_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 4. verification (ID / role / phone / email verification audit)
+CREATE TABLE IF NOT EXISTS verification (
+  Log_id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  type ENUM('email','phone','ID','Role') NOT NULL,
+  status ENUM('Pending','Approved','Rejected') NOT NULL DEFAULT 'Pending',
+  admin_id INT NULL,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 5. otp_store (OTP/one-time codes)
+CREATE TABLE IF NOT EXISTS otp_store (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  identifier VARCHAR(255) NOT NULL,
+  otp_hash VARCHAR(255) NOT NULL,
+  purpose ENUM('email','phone','password_reset') DEFAULT 'email',
+  expires_at DATETIME,
+  attempts_left INT DEFAULT 5,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX (identifier),
+  INDEX (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 6. driver_availability
+CREATE TABLE IF NOT EXISTS driver_availability (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  date DATE NOT NULL,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  seats INT DEFAULT 1,
+  vehicle_info VARCHAR(255),
+  slot_date DATE NOT NULL,
+  slot_time VARCHAR(32) NOT NULL,
+  -- created_at removed intentionally (app doesn't read it)
+  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+  INDEX (date),
+  INDEX (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 7. bookings
+CREATE TABLE IF NOT EXISTS bookings (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  rider_id INT NOT NULL,
+  driver_id INT NOT NULL,
+  availability_id INT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  pickup TEXT,
+  dropoff TEXT,
+  pax INT DEFAULT 1,
+  female_only TINYINT(1) DEFAULT 0,
+  status ENUM('Pending','Confirmed','Rejected','Cancelled','Completed') DEFAULT 'Pending',
+  FOREIGN KEY (rider_id) REFERENCES users(user_id) ON DELETE SET NULL,
+  FOREIGN KEY (driver_id) REFERENCES users(user_id) ON DELETE SET NULL,
+  FOREIGN KEY (availability_id) REFERENCES driver_availability(id) ON DELETE SET NULL,
+  INDEX (rider_id), INDEX (driver_id), INDEX (availability_id), INDEX (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 8. tr_details (transaction details) -- ID is varchar (app generates TX... string)
+CREATE TABLE IF NOT EXISTS tr_details (
+  ID VARCHAR(100) NOT NULL PRIMARY KEY,      -- transaction id (TX...)
+  Name VARCHAR(100),
+  UPI_ID VARCHAR(100),
+  AMT DECIMAL(10,2),
+  Date DATETIME DEFAULT CURRENT_TIMESTAMP,
+  Status VARCHAR(50),
+  rider_id INT,
+  driver_id INT,
+  slot_date DATE,
+  slot_time VARCHAR(32),
+  amount DECIMAL(10,2),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  rider_upi VARCHAR(100),
+  driver_received DECIMAL(10,2) DEFAULT 0.00,
+  FOREIGN KEY (rider_id) REFERENCES users(user_id) ON DELETE SET NULL,
+  FOREIGN KEY (driver_id) REFERENCES users(user_id) ON DELETE SET NULL,
+  INDEX (rider_id), INDEX (driver_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 9. payments
+CREATE TABLE IF NOT EXISTS payments (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  tr_id VARCHAR(100),           -- matches tr_details.ID
+  payer_upi VARCHAR(100),
+  driver_id INT,
+  amount DECIMAL(10,2),
+  status VARCHAR(50),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (driver_id) REFERENCES users(user_id) ON DELETE SET NULL,
+  INDEX (tr_id), INDEX (driver_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 10. feedback
+CREATE TABLE IF NOT EXISTS feedback (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id INT,
+  role ENUM('Driver','Rider','Other') DEFAULT 'Other',
+  overall INT,
+  safety INT,
+  payment_exp INT,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  from_user INT,
+  for_role ENUM('Rider','Driver','General') DEFAULT 'General',
+  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE SET NULL,
+  INDEX (from_user)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
