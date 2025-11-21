@@ -1,0 +1,70 @@
+# db.py
+import mysql.connector
+from tkinter import messagebox
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': 'AAT(1511)',   # change if needed
+    'database': 'share_ride'
+}
+
+def get_conn():
+    try:
+        return mysql.connector.connect(**DB_CONFIG)
+    except Exception as e:
+        messagebox.showerror("DB error", f"Unable to connect to DB: {e}")
+        return None
+
+# lightweight wrappers to centralize error handling
+def fetchone(query: str, params=()) -> Optional[Dict[str, Any]]:
+    conn = get_conn()
+    if not conn: return None
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(query, params)
+        return cur.fetchone()
+    except Exception as e:
+        messagebox.showerror("DB error", str(e)); return None
+    finally:
+        cur.close(); conn.close()
+
+def fetchall(query: str, params=()) -> list:
+    conn = get_conn()
+    if not conn: return []
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(query, params)
+        return cur.fetchall()
+    except Exception as e:
+        messagebox.showerror("DB error", str(e)); return []
+    finally:
+        cur.close(); conn.close()
+
+def execute_commit(query: str, params=()) -> bool:
+    conn = get_conn()
+    if not conn: return False
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("DB error", str(e)); return False
+    finally:
+        cur.close(); conn.close()
+
+def insert_and_get_id(query: str, params=()):
+    conn = get_conn()
+    if not conn: return None
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        conn.commit()
+        return cur.lastrowid
+    except Exception as e:
+        conn.rollback(); messagebox.showerror("DB error", str(e)); return None
+    finally:
+        cur.close(); conn.close()
